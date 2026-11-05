@@ -1,0 +1,87 @@
+# Reusable workflow: builds the image of a pull request as ghcr.io/<owner>/<repo>:pr-<head sha> and comments
+# the preview URL on the PR. The `previews` ApplicationSet in Kr4is/homelab-gitops deploys it.
+#
+# Caller (in any repo with the `homelab-preview` topic and a Dockerfile serving on port 8080):
+#
+#   name: pr-preview
+#   on:
+#     pull_request:
+#       types: [opened, synchronize, reopened, labeled]
+#   jobs:
+#     preview:
+#       if: contains(github.event.pull_request.labels.*.name, 'preview')
+#       uses: Kr4is/homelab-workflows/.github/workflows/pr-preview.yml@main
+#       permissions:
+#         contents: read
+#         packages: write
+#         pull-requests: write
+#
+name: pr-preview
+
+on:
+  workflow_call:
+    inputs:
+      context:
+        description: Docker build context
+        type: string
+        default: .
+      dockerfile:
+        description: Path to the Dockerfile, relative to the repo root
+        type: string
+        default: Dockerfile
+
+jobs:
+  image:
+    # Forks get a read-only token and cannot push to GHCR.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      pull-requests: write
+    concurrency:
+      group: pr-preview-${{ github.repository }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5 # lowercases the image name, which GHCR requires
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: type=raw,value=pr-${{ github.event.pull_request.head.sha }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: linux/amd64 # the homelab node is amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Comment the preview URL
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          # Same host the ApplicationSet builds: lowercase, . and _ to -, at most 40 chars.
+          slug=$(printf '%s' "$REPO_NAME" | tr 'A-Z._' 'a-z--' | cut -c1-40)
+          url="https://${slug}-pr-${PR}.brunocabado.com"
+          body=$(printf '<!-- homelab-preview -->\n🔎 **Preview:** %s (LAN / tailnet only)\n\nImage `pr-%s`, ArgoCD picks it up within ~3 minutes.' "$url" "${SHA:0:7}")
+          id=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" --paginate \
+            --jq '.[] | select(.body | startswith("<!-- homelab-preview -->")) | .id' | head -1)
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${id}" -f body="$body" > /dev/null
+          else
+            gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "$body"
+          fi
+          echo "Preview: $url" >> "$GITHUB_STEP_SUMMARY"
